@@ -1,0 +1,75 @@
+name: TDS Compose validation
+on: workflow_dispatch
+permissions: {}
+jobs:
+  compose-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - name: Start and verify genuine FastAPI and Redis
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/tds-compose
+          cd /tmp/tds-compose
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('app.py').write_text("import os\nfrom fastapi import FastAPI, HTTPException\nimport redis\napi=FastAPI()\nstore=redis.Redis.from_url(os.environ.get(\"REDIS_URL\",\"redis://redis:6379/0\"),decode_responses=True)\n@api.post(\"/hit/{key}\")\ndef hit(key:str):\n    return {\"key\":key,\"count\":store.incr(\"tds:counter:\"+key)}\n@api.get(\"/count/{key}\")\ndef count(key:str):\n    return {\"key\":key,\"count\":int(store.get(\"tds:counter:\"+key) or 0)}\n@api.get(\"/healthz\")\ndef health():\n    try:\n        if store.ping(): return {\"status\":\"ok\",\"redis\":\"up\"}\n    except redis.RedisError: pass\n    raise HTTPException(503,\"Redis unavailable\")\n")
+          Path('compose.yaml').write_text("services:\n  redis:\n    image: redis:7-alpine\n    command: [\"redis-server\", \"--appendonly\", \"yes\"]\n    volumes:\n      - redis-data:/data\n    healthcheck:\n      test: [\"CMD\", \"redis-cli\", \"ping\"]\n      interval: 2s\n      timeout: 2s\n      retries: 20\n  api:\n    image: python:3.13-slim\n    working_dir: /app\n    volumes:\n      - .:/app:ro\n    environment:\n      REDIS_URL: redis://redis:6379/0\n    command: [\"sh\", \"-c\", \"pip install --no-cache-dir -r requirements.txt && exec uvicorn app:api --host 0.0.0.0 --port 8000\"]\n    ports:\n      - \"127.0.0.1:8001:8000\"\n    depends_on:\n      redis:\n        condition: service_healthy\nvolumes:\n  redis-data:\n")
+          Path('requirements.txt').write_text('fastapi\nuvicorn\nredis\n')
+          PY
+          docker compose up -d
+          python3 - <<'PY'
+          import urllib.request,json,time,uuid,subprocess
+          base='http://127.0.0.1:8001'
+          def req(path,post=False):
+              r=urllib.request.urlopen(urllib.request.Request(base+path,data=b'' if post else None),timeout=5)
+              return json.load(r)
+          for _ in range(120):
+              try:
+                  if req('/healthz')=={'status':'ok','redis':'up'}: break
+              except Exception: pass
+              time.sleep(1)
+          else: raise RuntimeError('Compose health check failed')
+          a='verify-a-'+uuid.uuid4().hex;b='verify-b-'+uuid.uuid4().hex
+          assert req('/hit/'+a,True)['count']==1
+          assert req('/hit/'+a,True)['count']==2
+          assert req('/hit/'+b,True)['count']==1
+          subprocess.run(['docker','compose','restart','api'],check=True)
+          for _ in range(60):
+              try:
+                  if req('/count/'+a)['count']==2: break
+              except Exception: pass
+              time.sleep(1)
+          else: raise RuntimeError('Redis persistence test failed')
+          assert req('/count/'+b)['count']==1
+          print('Real Docker Compose, Redis INCR, key isolation and restart persistence passed.')
+          PY
+      - name: Public grading tunnel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import urllib.request,json,re,hashlib,pathlib,os
+          release=json.load(urllib.request.urlopen('https://api.github.com/repos/cloudflare/cloudflared/releases/tags/2026.10.0'))
+          asset=next(a for a in release['assets'] if a['name']=='cloudflared-linux-amd64')
+          data=urllib.request.urlopen(asset['browser_download_url']).read()
+          expected=re.search('cloudflared-linux-amd64: ([0-9a-f]{64})',release['body']).group(1)
+          assert hashlib.sha256(data).hexdigest()==expected
+          pathlib.Path('/tmp/tds-cloudflared').write_bytes(data)
+          os.chmod('/tmp/tds-cloudflared',0o755)
+          PY
+          /tmp/tds-cloudflared tunnel --no-autoupdate --protocol http2 --url http://127.0.0.1:8001 > /tmp/tds-tunnel.log 2>&1 &
+          python3 - <<'PY'
+          import pathlib,re,time,os
+          for _ in range(90):
+              log=pathlib.Path('/tmp/tds-tunnel.log').read_text()
+              found=re.search('https://[a-z0-9-]+[.]trycloudflare[.]com',log)
+              if found: break
+              time.sleep(1)
+          else: raise RuntimeError(log[-2500:])
+          url=found.group()
+          print('COMPOSE_GRADING_URL='+url,flush=True)
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f: f.write('### Compose grading endpoint\n'+url+'\n')
+          PY
+          sleep 3600
